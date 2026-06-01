@@ -1,24 +1,11 @@
 /*
- * 阶段 5 - 练习 6：FlashAttention v2 — 论文 FA-2 Algorithm 1
- *
- * 论文循环顺序（Dao 2023）：
- *   for i = 1..Tr:           外层 Q tile（grid block = Q_i）
- *     初始化 O_i, m_i, ℓ_i 在片上
- *     for j = 1..Tc:         内层 KV tile
- *       S_ij = Q_i K_j^T → online softmax → 更新 O_i（片上）
- *     最后写 O_i, L_i = m_i + log(ℓ_i) 到 HBM（各一次）
- *
- * 相对 FA-1 (lesson12)：
- *   - 循环顺序对调：外 i 内 j
- *   - O/m/ℓ 不在每个 j 读写 HBM（O 在寄存器 o_acc[] 跨 j 累积）
- *
- * 编译：nvcc -O3 -o lesson13 lesson13_flash_attention_v2.cu
- * 运行：./lesson13 [seq]
+ * FlashAttention v2 — FA-2 Algorithm 1
+ * nvcc -O3 -arch=sm_86 -o lesson13 lesson13_flash_attention_v2.cu
+ * ./lesson13 [seq]
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
 #include <cuda_runtime.h>
 #include <float.h>
@@ -40,9 +27,19 @@
 #define TD 64
 #define BLOCK 256
 #define O_CHUNK ((BR * DIM + BLOCK - 1) / BLOCK)
+#define SMEM_O_TILE_BYTES ((size_t)BR * DIM * sizeof(float))
+#define SMEM_EXTENDED_MAX 98304
 
-static size_t smem_bytes(void) {
+static size_t smem_bytes_base(void) {
     return (BR * TD + BC * TD + BC * TD + BR * BC) * sizeof(float);
+}
+
+static size_t smem_bytes_o_tile(void) {
+    return smem_bytes_base() + SMEM_O_TILE_BYTES;
+}
+
+static bool can_use_smem_o(const cudaDeviceProp *prop) {
+    return prop->major >= 8 && smem_bytes_o_tile() <= SMEM_EXTENDED_MAX;
 }
 
 static float dot_cpu(const float *a, const float *b, int dim) {
@@ -84,12 +81,9 @@ void attention_cpu(const float *Q, const float *K, const float *V, float *out,
     free(scores);
 }
 
-/*
- * FA-2 Algorithm 1：外 i (blockIdx.x = Q tile)，内 j (KV loop)
- * O_i 在 o_acc[] 跨 j 累积；m_i, ℓ_i 在 smem；j 结束后写 O, L
- */
-__global__ void flash_attention_v2(const float *Q, const float *K, const float *V,
-                                   float *O, float *L, int seq, int dim) {
+__global__ void flash_attention_v2_smem(const float *Q, const float *K,
+                                          const float *V, float *O, float *L,
+                                          int seq, int dim) {
     const int q_start = blockIdx.x * BR;
     if (q_start >= seq) return;
 
@@ -97,13 +91,143 @@ __global__ void flash_attention_v2(const float *Q, const float *K, const float *
     const int tid = threadIdx.x;
     const float scale = rsqrtf((float)dim);
 
-    /* 论文：O_i^(0)=0 — 寄存器累积，j 循环内不写 HBM */
+    __shared__ float m_i[BR];
+    __shared__ float l_i[BR];
+    __shared__ float row_alpha[BR];
+
+    extern __shared__ float smem[];
+    float *Qs = smem;
+    float *Ks = Qs + BR * TD;
+    float *Vs = Ks + BC * TD;
+    float *S = Vs + BC * TD;
+    float *Os = S + BR * BC;
+
+    for (int idx = tid; idx < br * dim; idx += blockDim.x) {
+        Os[idx] = 0.0f;
+    }
+    if (tid < br) {
+        m_i[tid] = -FLT_MAX;
+        l_i[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const int Tc = (seq + BC - 1) / BC;
+    for (int j = 0; j < Tc; ++j) {
+        const int kv_start = j * BC;
+        const int bc = min(BC, seq - kv_start);
+
+        for (int idx = tid; idx < br * BC; idx += blockDim.x) {
+            S[idx] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int td = 0; td < dim; td += TD) {
+            const int td_size = min(TD, dim - td);
+
+            for (int idx = tid; idx < br * td_size; idx += blockDim.x) {
+                const int r = idx / td_size;
+                const int t = idx % td_size;
+                Qs[r * TD + t] = Q[(q_start + r) * dim + td + t];
+            }
+            for (int idx = tid; idx < bc * td_size; idx += blockDim.x) {
+                const int c = idx / td_size;
+                const int t = idx % td_size;
+                Ks[c * TD + t] = K[(kv_start + c) * dim + td + t];
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < br * bc; idx += blockDim.x) {
+                const int r = idx / bc;
+                const int c = idx % bc;
+                float dot = 0.0f;
+                for (int t = 0; t < td_size; ++t) {
+                    dot += Qs[r * TD + t] * Ks[c * TD + t];
+                }
+                S[r * BC + c] += dot;
+            }
+            __syncthreads();
+        }
+
+        for (int idx = tid; idx < br * bc; idx += blockDim.x) {
+            S[idx] *= scale;
+        }
+        __syncthreads();
+
+        for (int r = tid; r < br; r += blockDim.x) {
+            float m_ij = -FLT_MAX;
+            for (int c = 0; c < bc; ++c) {
+                m_ij = fmaxf(m_ij, S[r * BC + c]);
+            }
+
+            const float m_old = m_i[r];
+            const float l_old = l_i[r];
+            const float m_new = fmaxf(m_old, m_ij);
+            const float alpha = expf(m_old - m_new);
+
+            float l_ij = 0.0f;
+            for (int c = 0; c < bc; ++c) {
+                const float p = expf(S[r * BC + c] - m_new);
+                S[r * BC + c] = p;
+                l_ij += p;
+            }
+
+            row_alpha[r] = alpha;
+            m_i[r] = m_new;
+            l_i[r] = alpha * l_old + l_ij;
+        }
+        __syncthreads();
+
+        for (int td = 0; td < dim; td += TD) {
+            const int td_size = min(TD, dim - td);
+
+            for (int idx = tid; idx < bc * td_size; idx += blockDim.x) {
+                const int c = idx / td_size;
+                const int t = idx % td_size;
+                Vs[c * TD + t] = V[(kv_start + c) * dim + td + t];
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < br * td_size; idx += blockDim.x) {
+                const int r = idx / td_size;
+                const int t = idx % td_size;
+                float pv = 0.0f;
+                for (int c = 0; c < bc; ++c) {
+                    pv += S[r * BC + c] * Vs[c * TD + t];
+                }
+                Os[r * dim + td + t] =
+                    row_alpha[r] * Os[r * dim + td + t] + pv;
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int idx = tid; idx < br * dim; idx += blockDim.x) {
+        const int r = idx / dim;
+        const int d = idx % dim;
+        const int row = q_start + r;
+        O[(size_t)row * dim + d] = Os[idx] / l_i[r];
+    }
+    for (int r = tid; r < br; r += blockDim.x) {
+        const int row = q_start + r;
+        L[row] = m_i[r] + logf(l_i[r]);
+    }
+}
+
+__global__ __launch_bounds__(BLOCK, 2) void flash_attention_v2_reg(
+    const float *Q, const float *K, const float *V, float *O, float *L,
+    int seq, int dim) {
+    const int q_start = blockIdx.x * BR;
+    if (q_start >= seq) return;
+
+    const int br = min(BR, seq - q_start);
+    const int tid = threadIdx.x;
+    const float scale = rsqrtf((float)dim);
+
     float o_acc[O_CHUNK];
     for (int k = 0; k < O_CHUNK; ++k) {
         o_acc[k] = 0.0f;
     }
 
-    /* 论文：m_i^(0)=-∞, ℓ_i^(0)=0 — 片上 smem，j 循环内不写 HBM */
     __shared__ float m_i[BR];
     __shared__ float l_i[BR];
     __shared__ float row_alpha[BR];
@@ -213,7 +337,6 @@ __global__ void flash_attention_v2(const float *Q, const float *K, const float *
         }
     }
 
-    /* 论文：最后写 O_i = O/ℓ_i，L_i = m_i + log(ℓ_i)（backward 用） */
     for (int k = 0; k < O_CHUNK; ++k) {
         const int flat = tid + k * blockDim.x;
         if (flat >= br * dim) continue;
@@ -228,24 +351,39 @@ __global__ void flash_attention_v2(const float *Q, const float *K, const float *
     }
 }
 
-bool verify(const float *gpu, const float *cpu, int n, float tol) {
-    float max_err = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        max_err = fmaxf(max_err, fabsf(gpu[i] - cpu[i]));
-    }
-    printf("  max_err = %.6f %s\n", max_err, max_err < tol ? "(OK)" : "(FAIL)");
-    return max_err < tol;
+static void configure_v2_smem_kernel(size_t smem_o) {
+    CUDA_CHECK(cudaFuncSetAttribute(
+        flash_attention_v2_smem, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)smem_o));
 }
 
-float benchmark_v2(const float *d_Q, const float *d_K, const float *d_V,
-                   float *d_out, float *d_L, int seq, int dim, size_t smem,
-                   int warmup, int repeats) {
+static void launch_v2(const float *d_Q, const float *d_K, const float *d_V,
+                      float *d_out, float *d_L, int seq, int dim, bool use_smem) {
     const int grid = (seq + BR - 1) / BR;
+    if (use_smem) {
+        const size_t smem_o = smem_bytes_o_tile();
+        configure_v2_smem_kernel(smem_o);
+        flash_attention_v2_smem<<<grid, BLOCK, smem_o>>>(
+            d_Q, d_K, d_V, d_out, d_L, seq, dim);
+    } else {
+        flash_attention_v2_reg<<<grid, BLOCK, smem_bytes_base()>>>(
+            d_Q, d_K, d_V, d_out, d_L, seq, dim);
+    }
+}
 
+static bool verify(const float *gpu, const float *cpu, int n, float tol) {
+    for (int i = 0; i < n; ++i) {
+        if (fabsf(gpu[i] - cpu[i]) > tol) return false;
+    }
+    return true;
+}
+
+static float benchmark_v2(const float *d_Q, const float *d_K, const float *d_V,
+                          float *d_out, float *d_L, int seq, int dim,
+                          bool use_smem, int warmup, int repeats) {
     for (int i = 0; i < warmup; ++i) {
         CUDA_CHECK(cudaMemset(d_out, 0, (size_t)seq * dim * sizeof(float)));
-        flash_attention_v2<<<grid, BLOCK, smem>>>(d_Q, d_K, d_V, d_out, d_L,
-                                                  seq, dim);
+        launch_v2(d_Q, d_K, d_V, d_out, d_L, seq, dim, use_smem);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -256,8 +394,7 @@ float benchmark_v2(const float *d_Q, const float *d_K, const float *d_V,
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < repeats; ++i) {
         CUDA_CHECK(cudaMemset(d_out, 0, (size_t)seq * dim * sizeof(float)));
-        flash_attention_v2<<<grid, BLOCK, smem>>>(d_Q, d_K, d_V, d_out, d_L,
-                                                  seq, dim);
+        launch_v2(d_Q, d_K, d_V, d_out, d_L, seq, dim, use_smem);
     }
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
@@ -284,20 +421,10 @@ int main(int argc, char **argv) {
 
     const int N = seq * DIM;
     const size_t bytes = (size_t)N * sizeof(float);
-    const size_t smem = smem_bytes();
-    const int Tr = (seq + BR - 1) / BR;
-    const int Tc = (seq + BC - 1) / BC;
 
-    int dev = 0;
-    CUDA_CHECK(cudaGetDevice(&dev));
     cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
-
-    printf("FlashAttention v2 — 论文 FA-2 Algorithm 1 (单头)\n");
-    printf("SEQ=%d, DIM=%d, BR=%d, BC=%d\n", seq, DIM, BR, BC);
-    printf("循环: 外层 i=1..Tr(%d) [grid], 内层 j=1..Tc(%d) [kernel loop]\n",
-           Tr, Tc);
-    printf("GPU: %s, smem/block=%.1f KB\n\n", prop.name, smem / 1024.0f);
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    const bool use_smem = can_use_smem_o(&prop);
 
     float *h_Q = (float *)malloc(bytes);
     float *h_K = (float *)malloc(bytes);
@@ -323,30 +450,23 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemcpy(d_V, h_V, bytes, cudaMemcpyHostToDevice));
 
     if (!skip_cpu) {
-        printf("CPU 参考计算中...\n");
         attention_cpu(h_Q, h_K, h_V, h_ref, seq, DIM);
     }
 
     CUDA_CHECK(cudaMemset(d_out, 0, bytes));
-    flash_attention_v2<<<Tr, BLOCK, smem>>>(d_Q, d_K, d_V, d_out, d_L, seq,
-                                            DIM);
+    launch_v2(d_Q, d_K, d_V, d_out, d_L, seq, DIM, use_smem);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
 
-    if (!skip_cpu) {
-        printf("FlashAttention v2 验证: %s\n",
-               verify(h_out, h_ref, N, 1e-2f) ? "通过" : "失败");
+    if (!skip_cpu && !verify(h_out, h_ref, N, 1e-2f)) {
+        fprintf(stderr, "验证失败\n");
+        return 1;
     }
 
     const float t_v2 =
-        benchmark_v2(d_Q, d_K, d_V, d_out, d_L, seq, DIM, smem, 2, 10);
+        benchmark_v2(d_Q, d_K, d_V, d_out, d_L, seq, DIM, use_smem, 2, 10);
     printf("FlashAttention v2 耗时: %.3f ms\n", t_v2);
-
-    printf("\n── FA-2 论文要点 ──\n");
-    printf("  外 i 内 j；O/m/ℓ 在 j 循环内留片上\n");
-    printf("  j 结束后写 O_i 与 L_i=m_i+log(ℓ_i) 各一次\n");
-    printf("  相对 FA-1: 减少 O_i, ℓ_i 的 HBM 往返\n");
 
     CUDA_CHECK(cudaFree(d_Q));
     CUDA_CHECK(cudaFree(d_K));

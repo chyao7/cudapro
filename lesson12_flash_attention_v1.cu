@@ -1,24 +1,11 @@
 /*
- * 阶段 5 - 练习 5：FlashAttention v1 — 论文 FA-1 Algorithm 1
- *
- * 论文循环顺序（Dao et al. 2022）：
- *   for j = 1..Tc:           外层 KV tile（host 顺序 launch，避免并行写竞争）
- *     for i = 1..Tr:         内层 Q tile（CUDA grid，每 block 一块 Q_i）
- *       从 HBM 加载 Q_i, O_i, m_i, ℓ_i
- *       S_ij = Q_i K_j^T → online softmax → 更新 O_i
- *       写回 O_i, m_i, ℓ_i 到 HBM
- *   最后 O_i /= ℓ_i
- *
- * 相对 lesson10：一遍 KV + Online Softmax（非两遍 Safe Softmax）
- * 相对 lesson13：v1 每个 (i,j) 都读写 HBM 上的 O/m/ℓ；v2 片上累积
- *
- * 编译：nvcc -O3 -o lesson12 lesson12_flash_attention_v1.cu
- * 运行：./lesson12 [seq]
+ * FlashAttention v1 — FA-1 Algorithm 1
+ * nvcc -O3 -o lesson12 lesson12_flash_attention_v1.cu
+ * ./lesson12 [seq]
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
 #include <cuda_runtime.h>
 #include <float.h>
@@ -84,9 +71,9 @@ void attention_cpu(const float *Q, const float *K, const float *V, float *out,
 }
 
 __device__ void fa_v1_online_softmax_row(float *S, int r, int bc, float m_row,
-                                        float *m_new_out, float *l_row_inout,
-                                        float *scale_m_out,
-                                        float *scale_ij_out) {
+                                         float *m_new_out, float *l_row_inout,
+                                         float *scale_m_out,
+                                         float *scale_ij_out) {
     float m_ij = -FLT_MAX;
     for (int c = 0; c < bc; ++c) {
         m_ij = fmaxf(m_ij, S[r * Bc + c]);
@@ -109,10 +96,6 @@ __device__ void fa_v1_online_softmax_row(float *S, int r, int bc, float m_row,
     *l_row_inout = scale_m * (*l_row_inout) + scale_ij * l_ij;
 }
 
-/*
- * FA-1 单步：固定 KV tile j，grid 上并行 Q tile i = blockIdx.x
- * 论文 Algorithm 1 第 5–15 行的一次 (i,j) 迭代
- */
 __global__ void flash_attention_v1_step(const float *Q, const float *K,
                                         const float *V, float *M, float *L,
                                         float *O, int j, int seq, int dim) {
@@ -138,7 +121,6 @@ __global__ void flash_attention_v1_step(const float *Q, const float *K,
     float *Vs = Ks + Bc * Td;
     float *S = Vs + Bc * Td;
 
-    /* 论文：Load Q_i, m_i, ℓ_i from HBM */
     for (int r = tid; r < br; r += blockDim.x) {
         const int row = q_start + r;
         m_tile[r] = M[row];
@@ -193,7 +175,6 @@ __global__ void flash_attention_v1_step(const float *Q, const float *K,
     }
     __syncthreads();
 
-    /* 论文：Load O_i, update, write O_i back to HBM */
     for (int td = 0; td < dim; td += Td) {
         const int td_size = min(Td, dim - td);
 
@@ -217,7 +198,6 @@ __global__ void flash_attention_v1_step(const float *Q, const float *K,
         __syncthreads();
     }
 
-    /* 论文：Write m_i, ℓ_i back to HBM */
     for (int r = tid; r < br; r += blockDim.x) {
         const int row = q_start + r;
         M[row] = m_tile[r];
@@ -226,7 +206,7 @@ __global__ void flash_attention_v1_step(const float *Q, const float *K,
 }
 
 __global__ void flash_attention_v1_finalize(float *O, const float *L, int seq,
-                                          int dim) {
+                                            int dim) {
     const int q_start = blockIdx.x * Br;
     if (q_start >= seq) return;
     const int br = min(Br, seq - q_start);
@@ -249,49 +229,33 @@ static void flash_attention_v1_launch(const float *d_Q, const float *d_K,
 
     for (int j = 0; j < Tc; ++j) {
         flash_attention_v1_step<<<Tr, BLOCK, smem>>>(d_Q, d_K, d_V, d_M, d_L,
-                                                       d_O, j, seq, dim);
+                                                     d_O, j, seq, dim);
     }
     flash_attention_v1_finalize<<<Tr, BLOCK>>>(d_O, d_L, seq, dim);
 }
 
-bool verify(const float *gpu, const float *cpu, int n, float tol) {
-    int bad = 0;
-    float max_err = 0.0f;
+static bool verify(const float *gpu, const float *cpu, int n, float tol) {
     for (int i = 0; i < n; ++i) {
-        const float err = fabsf(gpu[i] - cpu[i]);
-        if (err > max_err) max_err = err;
-        if (err > tol) {
-            if (bad < 5) {
-                fprintf(stderr, "  mismatch[%d]: gpu=%.6f cpu=%.6f err=%.6f\n",
-                        i, gpu[i], cpu[i], err);
-            }
-            ++bad;
-        }
-    }
-    if (bad > 0) {
-        fprintf(stderr, "  total mismatches: %d / %d, max_err=%.6f\n", bad, n,
-                max_err);
-        return false;
+        if (fabsf(gpu[i] - cpu[i]) > tol) return false;
     }
     return true;
 }
 
-float benchmark_v1(const float *d_Q, const float *d_K, const float *d_V,
-                   float *d_M, float *d_L, float *d_out, int seq, int dim,
-                   size_t smem_bytes, int warmup, int repeats) {
+static void init_m_l(float *d_M, float *d_L, int seq) {
+    float *h_M = (float *)malloc((size_t)seq * sizeof(float));
+    for (int i = 0; i < seq; ++i) h_M[i] = -FLT_MAX;
+    CUDA_CHECK(cudaMemcpy(d_M, h_M, (size_t)seq * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_L, 0, (size_t)seq * sizeof(float)));
+    free(h_M);
+}
+
+static float benchmark_v1(const float *d_Q, const float *d_K, const float *d_V,
+                          float *d_M, float *d_L, float *d_out, int seq,
+                          int dim, size_t smem_bytes, int warmup, int repeats) {
     for (int i = 0; i < warmup; ++i) {
         CUDA_CHECK(cudaMemset(d_out, 0, (size_t)seq * dim * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_M, 0, (size_t)seq * sizeof(float)));
-        CUDA_CHECK(
-            cudaMemset(d_L, 0, (size_t)seq * sizeof(float))); /* init below */
-        /* M=-inf, L=0 */
-        int n = seq;
-        float *h_init = (float *)malloc((size_t)n * sizeof(float));
-        for (int k = 0; k < n; ++k) h_init[k] = -FLT_MAX;
-        CUDA_CHECK(cudaMemcpy(d_M, h_init, (size_t)n * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        free(h_init);
-        CUDA_CHECK(cudaMemset(d_L, 0, (size_t)seq * sizeof(float)));
+        init_m_l(d_M, d_L, seq);
         flash_attention_v1_launch(d_Q, d_K, d_V, d_M, d_L, d_out, seq, dim,
                                   smem_bytes);
     }
@@ -304,13 +268,7 @@ float benchmark_v1(const float *d_Q, const float *d_K, const float *d_V,
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < repeats; ++i) {
         CUDA_CHECK(cudaMemset(d_out, 0, (size_t)seq * dim * sizeof(float)));
-        int n = seq;
-        float *h_init = (float *)malloc((size_t)n * sizeof(float));
-        for (int k = 0; k < n; ++k) h_init[k] = -FLT_MAX;
-        CUDA_CHECK(cudaMemcpy(d_M, h_init, (size_t)n * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        free(h_init);
-        CUDA_CHECK(cudaMemset(d_L, 0, (size_t)seq * sizeof(float)));
+        init_m_l(d_M, d_L, seq);
         flash_attention_v1_launch(d_Q, d_K, d_V, d_M, d_L, d_out, seq, dim,
                                   smem_bytes);
     }
@@ -322,15 +280,6 @@ float benchmark_v1(const float *d_Q, const float *d_K, const float *d_V,
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     return ms / repeats;
-}
-
-static void init_m_l(float *d_M, float *d_L, int seq) {
-    float *h_M = (float *)malloc((size_t)seq * sizeof(float));
-    for (int i = 0; i < seq; ++i) h_M[i] = -FLT_MAX;
-    CUDA_CHECK(cudaMemcpy(d_M, h_M, (size_t)seq * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_L, 0, (size_t)seq * sizeof(float)));
-    free(h_M);
 }
 
 int main(int argc, char **argv) {
@@ -349,20 +298,6 @@ int main(int argc, char **argv) {
     const int N = seq * DIM;
     const size_t bytes = (size_t)N * sizeof(float);
     const size_t smem_bytes = fa_v1_smem_bytes();
-    const int Tr = (seq + Br - 1) / Br;
-    const int Tc = (seq + Bc - 1) / Bc;
-
-    int dev = 0;
-    CUDA_CHECK(cudaGetDevice(&dev));
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
-
-    printf("FlashAttention v1 — 论文 FA-1 Algorithm 1 (单头)\n");
-    printf("SEQ=%d, DIM=%d, Br=%d, Bc=%d\n", seq, DIM, Br, Bc);
-    printf("循环: 外层 j=1..Tc(%d) [host 顺序], 内层 i=1..Tr(%d) [grid]\n", Tc,
-           Tr);
-    printf("GPU: %s, smem/block=%.1f KB\n\n", prop.name,
-           smem_bytes / 1024.0f);
 
     float *h_Q = (float *)malloc(bytes);
     float *h_K = (float *)malloc(bytes);
@@ -389,7 +324,6 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemcpy(d_V, h_V, bytes, cudaMemcpyHostToDevice));
 
     if (!skip_cpu) {
-        printf("CPU 参考计算中...\n");
         attention_cpu(h_Q, h_K, h_V, h_ref, seq, DIM);
     }
 
@@ -401,18 +335,14 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_out, d_O, bytes, cudaMemcpyDeviceToHost));
 
-    if (!skip_cpu) {
-        printf("FlashAttention v1 验证: %s\n",
-               verify(h_out, h_ref, N, 1e-2f) ? "通过" : "失败");
+    if (!skip_cpu && !verify(h_out, h_ref, N, 1e-2f)) {
+        fprintf(stderr, "验证失败\n");
+        return 1;
     }
 
     const float t_v1 = benchmark_v1(d_Q, d_K, d_V, d_M, d_L, d_O, seq, DIM,
                                     smem_bytes, 2, 10);
     printf("FlashAttention v1 耗时: %.3f ms\n", t_v1);
-
-    printf("\n── FA-1 论文要点 ──\n");
-    printf("  每个 (i,j): HBM 读 m,ℓ,O → 计算 → HBM 写 m,ℓ,O\n");
-    printf("  相对 FA-2: 外 j 内 i；O/ℓ/m 不驻留片上跨 j\n");
 
     CUDA_CHECK(cudaFree(d_Q));
     CUDA_CHECK(cudaFree(d_K));

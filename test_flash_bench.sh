@@ -13,6 +13,19 @@ cd "$ROOT"
 NVCC="${NVCC:-nvcc}"
 OPT="${OPT:--O3}"
 
+# GPU 架构：默认从 nvidia-smi 读取 compute_cap（如 8.6 → sm_86）
+# 手动覆盖：CUDA_ARCH=sm_86 ./test_flash_bench.sh
+if [[ -z "${CUDA_ARCH:-}" ]] && command -v nvidia-smi &>/dev/null; then
+    CCAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+    if [[ -n "$CCAP" ]]; then
+        CUDA_ARCH="sm_${CCAP}"
+    fi
+fi
+ARCH_FLAGS=()
+if [[ -n "${CUDA_ARCH:-}" ]]; then
+    ARCH_FLAGS=(-arch="$CUDA_ARCH")
+fi
+
 DEFAULT_SEQS=(512 1024 2048 4096 8192)
 if [[ $# -gt 0 ]]; then
     SEQS=("$@")
@@ -29,10 +42,15 @@ if ! nvidia-smi &>/dev/null; then
     echo "警告: nvidia-smi 不可用，若运行失败请先 sudo reboot 修复驱动" >&2
 fi
 
+GPU_NAME=""
+if command -v nvidia-smi &>/dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+fi
 echo "==> 编译 lesson10(标准) / lesson12(v1) / lesson13(v2)"
-"$NVCC" $OPT -o lesson10 lesson10_flash_attention.cu
-"$NVCC" $OPT -o lesson12 lesson12_flash_attention_v1.cu
-"$NVCC" $OPT -o lesson13 lesson13_flash_attention_v2.cu
+echo "    GPU: ${GPU_NAME:-未知}  arch: ${CUDA_ARCH:-默认}"
+"$NVCC" $OPT "${ARCH_FLAGS[@]}" -o lesson10 lesson10_flash_attention.cu
+"$NVCC" $OPT "${ARCH_FLAGS[@]}" -o lesson12 lesson12_flash_attention_v1.cu
+"$NVCC" $OPT "${ARCH_FLAGS[@]}" -o lesson13 lesson13_flash_attention_v2.cu
 echo "    完成"
 echo
 
@@ -57,6 +75,3 @@ for seq in "${SEQS[@]}"; do
         "$seq" "$t10" "$t12" "$t13" "$r1" "$r2"
 done
 
-echo
-echo "演进: lesson10=标准(两遍KV)  lesson12=v1(Online Softmax)  lesson13=v2(FA-2 O片上累积)"
-echo "      v1/base、v2/base > 1 表示比标准版快；老 GPU 上 v2 未必更快"

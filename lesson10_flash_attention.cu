@@ -1,28 +1,7 @@
 /*
- * 阶段 5 - 练习 4：FlashAttention 标准版（Baseline）
- *
- * 标准 Attention（三 kernel，8 次 HBM 读写）：
- *   S = Q K^T → P = softmax(S) → O = P V
- *   中间 S,P 各 O(N^2) 在 HBM
- *
- * 本文件：分块 + Kernel 融合，但 **不用 Online Softmax**（那是 lesson12 v1）
- *
- * 两遍 KV 扫描（Safe Softmax，全局 m_i 已知后再算 P）：
- *   Pass 1: 遍历所有 KV tile，S_ij = Q_i K_j^T，更新 m_i = max(m_i, rowmax(S_ij))
- *   Pass 2: 再遍历 KV tile，P_ij = exp(S_ij - m_i)，l_i += rowsum(P_ij)，O_i += P_ij V_j
- *   最后 O_i /= l_i
- *
- * IO 优化（相对标准 Attention）：
- *   - S_tile = [Br×Bc] 只在 SRAM，不写回 HBM
- *   - 单 kernel 融合 QK^T + softmax + P@V
- *   - smem 固定 ~28KB，与 seq 无关
- *
- * 代价：KV 扫两遍（v1 的 Online Softmax 只需一遍）
- *
- * 演进：lesson10=标准分块  lesson12=v1(Online Softmax)  lesson13=v2(warp)
- *
- * 编译：nvcc -O3 -o lesson10 lesson10_flash_attention.cu
- * 运行：./lesson10 [seq] [--gpu-only]
+ * FlashAttention 标准版 — 两遍 Safe Softmax
+ * nvcc -O3 -o lesson10 lesson10_flash_attention.cu
+ * ./lesson10 [seq] [--gpu-only]
  */
 
 #include <stdio.h>
@@ -92,7 +71,6 @@ void attention_cpu(const float *Q, const float *K, const float *V, float *out,
     free(scores);
 }
 
-/* 计算片上 S[br×bc] = scale * Q_i K_j^T（d 分块累加） */
 __device__ void compute_s_tile(const float *Q, const float *K, float *Qs,
                                float *Ks, float *S, int q_start, int kv_start,
                                int br, int bc, int dim, int tid, float scale) {
@@ -134,9 +112,6 @@ __device__ void compute_s_tile(const float *Q, const float *K, float *Qs,
     __syncthreads();
 }
 
-/*
- * 标准版 FlashAttention：两遍 KV 扫描，无 Online Softmax
- */
 __global__ void flash_attention(const float *Q, const float *K, const float *V,
                                 float *O, int seq, int dim) {
     const int q_start = blockIdx.x * BR;
@@ -163,7 +138,6 @@ __global__ void flash_attention(const float *Q, const float *K, const float *V,
 
     const int Tc = (seq + BC - 1) / BC;
 
-    /* ── Pass 1: 全局 row max（Safe Softmax 第一步） ── */
     for (int j = 0; j < Tc; ++j) {
         const int kv_start = j * BC;
         const int bc = min(BC, seq - kv_start);
@@ -181,7 +155,6 @@ __global__ void flash_attention(const float *Q, const float *K, const float *V,
         __syncthreads();
     }
 
-    /* ── Pass 2: 固定 m_i，累加 l_i 和 O_i ── */
     for (int j = 0; j < Tc; ++j) {
         const int kv_start = j * BC;
         const int bc = min(BC, seq - kv_start);
@@ -232,29 +205,14 @@ __global__ void flash_attention(const float *Q, const float *K, const float *V,
     }
 }
 
-bool verify(const float *gpu, const float *cpu, int n, float tol) {
-    int bad = 0;
-    float max_err = 0.0f;
+static bool verify(const float *gpu, const float *cpu, int n, float tol) {
     for (int i = 0; i < n; ++i) {
-        const float err = fabsf(gpu[i] - cpu[i]);
-        if (err > max_err) max_err = err;
-        if (err > tol) {
-            if (bad < 5) {
-                fprintf(stderr, "  mismatch[%d]: gpu=%.6f cpu=%.6f err=%.6f\n", i,
-                        gpu[i], cpu[i], err);
-            }
-            ++bad;
-        }
-    }
-    if (bad > 0) {
-        fprintf(stderr, "  total mismatches: %d / %d, max_err=%.6f\n", bad, n,
-                max_err);
-        return false;
+        if (fabsf(gpu[i] - cpu[i]) > tol) return false;
     }
     return true;
 }
 
-float benchmark_flash(const float *d_Q, const float *d_K, const float *d_V,
+static float benchmark_flash(const float *d_Q, const float *d_K, const float *d_V,
                       float *d_out, int seq, int dim, size_t smem_bytes,
                       int warmup, int repeats) {
     const int grid = (seq + BR - 1) / BR;
@@ -305,21 +263,6 @@ int main(int argc, char **argv) {
     const size_t bytes = (size_t)N * sizeof(float);
     const size_t smem_bytes = flash_smem_bytes();
 
-    int dev = 0;
-    CUDA_CHECK(cudaGetDevice(&dev));
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
-
-    printf("FlashAttention 标准版 — 分块融合，两遍 Safe Softmax (单头)\n");
-    printf("SEQ=%d, DIM=%d, B_r=%d, B_c=%d, T_d=%d\n", seq, DIM, BR, BC, TD);
-    printf("GPU: %s, smem/block=%.1f KB\n\n", prop.name,
-           smem_bytes / 1024.0f);
-    printf("── 算法 ──\n");
-    printf("  Pass1: 扫 KV tile → 求全局 m_i = rowmax(S)\n");
-    printf("  Pass2: 再扫 KV tile → P=exp(S-m_i), O+=PV, O/=l_i\n");
-    printf("  无 Online Softmax（v1/lesson12 才引入，一遍 KV 即可）\n");
-    printf("  S_tile=[%d×%d] 仅在 SRAM，不写 HBM\n\n", BR, BC);
-
     float *h_Q = (float *)malloc(bytes);
     float *h_K = (float *)malloc(bytes);
     float *h_V = (float *)malloc(bytes);
@@ -343,7 +286,6 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemcpy(d_V, h_V, bytes, cudaMemcpyHostToDevice));
 
     if (!skip_cpu) {
-        printf("CPU 标准 Attention 参考计算中...\n");
         attention_cpu(h_Q, h_K, h_V, h_ref, seq, DIM);
     }
 
@@ -354,9 +296,9 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
 
-    if (!skip_cpu) {
-        printf("FlashAttention 标准版验证: %s\n",
-               verify(h_out, h_ref, N, 1e-2f) ? "通过" : "失败");
+    if (!skip_cpu && !verify(h_out, h_ref, N, 1e-2f)) {
+        fprintf(stderr, "验证失败\n");
+        return 1;
     }
 
     const float t_flash =
