@@ -29,7 +29,7 @@
 #define BLOCK 256
 
 static size_t flash_smem_bytes(void) {
-    return (BR * TD + BC * TD + BC * TD + BR * BC) * sizeof(float);
+    return (BR * TD + BC * TD + BC * TD + BR * BC) * sizeof(float); //存的q,k,v,s
 }
 
 static float dot_cpu(const float *a, const float *b, int dim) {
@@ -267,7 +267,7 @@ int main(int argc, char **argv) {
     float *h_K = (float *)malloc(bytes);
     float *h_V = (float *)malloc(bytes);
     float *h_out = (float *)malloc(bytes);
-    float *h_ref = (float *)malloc(bytes);
+    float *h_ref = (float *)malloc(bytes); //
 
     srand(42);
     for (int i = 0; i < N; ++i) {
@@ -291,7 +291,7 @@ int main(int argc, char **argv) {
 
     CUDA_CHECK(cudaMemset(d_out, 0, bytes));
     flash_attention<<<(seq + BR - 1) / BR, BLOCK, smem_bytes>>>(
-        d_Q, d_K, d_V, d_out, seq, DIM);
+        d_Q, d_K, d_V, d_out, seq, DIM);//启动kernel,seq+br-1/br代表grid大小,BLOCK代表block大小,smem_bytes代表shared memory大小
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));

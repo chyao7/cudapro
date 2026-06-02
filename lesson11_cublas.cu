@@ -119,14 +119,8 @@ void matmul_cpu(const float *a, const float *b, float *c, int m, int n, int k) {
 void cublas_gemm_rowmajor(cublasHandle_t handle, int m, int n, int k,
                           const float *d_A, const float *d_B, float *d_C,
                           float alpha, float beta) {
-    CUBLAS_CHECK(cublasSgemm(handle,
-                             CUBLAS_OP_T, CUBLAS_OP_T,
-                             n, m, k,
-                             &alpha,
-                             d_B, k,
-                             d_A, k,
-                             &beta,
-                             d_C, n));
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha,
+                             d_B, n, d_A, k, &beta, d_C, n));
 }
 
 bool verify(const float *ref, const float *got, int count, float tol) {
@@ -257,9 +251,9 @@ int main() {
     printf("  cublasCreate(&handle)          创建句柄\n");
     printf("  cublasDestroy(handle)          销毁句柄\n");
     printf("  cublasSetStream(handle, stream) 绑定 CUDA stream\n");
-    printf("  cublasSgemm(handle, opB, opA, n, m, k,\n");
-    printf("              &alpha, d_B, ldb, d_A, lda, &beta, d_C, ldc)\n");
-    printf("  row-major 技巧: OP_T + OP_T, 维度传 (n,m,k), lda=行宽\n");
+    printf("  cublasSgemm(handle, OP_N, OP_N, n, m, k,\n");
+    printf("              &alpha, d_B, n, d_A, k, &beta, d_C, n)\n");
+    printf("  row-major: 内存布局等同 col-major 的 C^T=B^T*A^T\n");
 
     CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaFree(d_A));
