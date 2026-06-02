@@ -1,0 +1,4 @@
+# cudapro 项目 cuda-gdb 初始化（VS Code cppdbg 通过 -ix 加载）
+set breakpoint pending on
+set cuda step_divergent_lanes off
+set cuda single_stepping_optimizations off

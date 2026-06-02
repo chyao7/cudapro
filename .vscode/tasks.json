@@ -1,0 +1,90 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "cmakeTarget",
+      "type": "promptString",
+      "description": "CMake target（如 lesson17_qkv_rmsnorm）",
+      "default": "lesson17_qkv_rmsnorm"
+    },
+    {
+      "id": "buildMode",
+      "type": "pickString",
+      "description": "构建类型",
+      "options": ["debug", "release"],
+      "default": "debug"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "cmake: configure (Debug)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/configure.sh",
+      "args": ["debug"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "cmake: configure (Release)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/configure.sh",
+      "args": ["release"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "cmake: build (Debug)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": ["debug", "all_cuda"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "dependsOn": ["cmake: configure (Debug)"],
+      "dependsOrder": "sequence",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "cmake: build (Release)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": ["release", "all_cuda"],
+      "group": "build",
+      "dependsOn": ["cmake: configure (Release)"],
+      "dependsOrder": "sequence",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "cmake: build target",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": ["debug", "${input:cmakeTarget}"],
+      "group": "build",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "cmake: build lesson00_vector_add",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": ["debug", "lesson00_vector_add"],
+      "group": "build",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "debug: cuda-gdb 终端 lesson00",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "'${workspaceFolder}/scripts/build.sh' debug lesson00_vector_add && cd '${workspaceFolder}/build/bin' && CUDA_LAUNCH_BLOCKING=1 cuda-gdb -ix '${workspaceFolder}/.cuda_gdbinit' ./lesson00_vector_add -ex 'break vector_add' -ex 'break src/lesson00_vector_add.cu:30'"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}

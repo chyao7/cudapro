@@ -1,0 +1,40 @@
+{
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.configureSettings": {
+    "CMAKE_BUILD_TYPE": "Debug"
+  },
+  "cmake.buildType": "Debug",
+  "cmake.launchTarget": "lesson00_vector_add",
+
+  "cmake.debugConfig": {
+    "type": "cppdbg",
+    "request": "launch",
+    "MIMode": "gdb",
+    "miDebuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+    "miDebuggerArgs": "-ix ${workspaceFolder}/.cuda_gdbinit",
+    "console": "integratedTerminal",
+    "stopAtEntry": false,
+    "environment": [
+      {
+        "name": "CUDA_LAUNCH_BLOCKING",
+        "value": "1"
+      }
+    ],
+    "setupCommands": [
+      {
+        "text": "-break-insert -f vector_add",
+        "ignoreFailures": false
+      },
+      {
+        "text": "-exec set cuda step_divergent_lanes off",
+        "ignoreFailures": true
+      },
+      {
+        "text": "-enable-pretty-printing",
+        "ignoreFailures": true
+      }
+    ]
+  },
+
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+}

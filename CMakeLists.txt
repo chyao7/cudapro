@@ -1,47 +1,51 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2020. All rights reserved.
+cmake_minimum_required(VERSION 3.18)
 
-# CMake lowest version requirement
-cmake_minimum_required(VERSION 3.16.0)
+# CUDA 13+ 须在 project() 前设定架构
+if(NOT DEFINED CUDAPRO_CUDA_ARCH)
+  set(CUDAPRO_CUDA_ARCH "86" CACHE STRING "CUDA compute capability without sm_ prefix")
+endif()
+set(CMAKE_CUDA_ARCHITECTURES "${CUDAPRO_CUDA_ARCH}")
+set(CMAKE_CUDA_FLAGS "-arch=sm_${CUDAPRO_CUDA_ARCH}" CACHE STRING "CUDA compiler flags" FORCE)
 
-# project information
-project(Ascend_C)
-set(SOC_VERSION "Ascend310P3" CACHE STRING "system on chip type")
-if(DEFINED ENV{USER} AND "$ENV{USER}" STREQUAL "root")
-    set(DEFAULT_ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest" CACHE PATH "ASCEND CANN package default installation directory for root user")
-else()
-    set(DEFAULT_ASCEND_CANN_PACKAGE_PATH "$ENV{HOME}/Ascend/ascend-toolkit/latest" CACHE PATH "ASCEND CANN package default installation directory for other user")
+project(cudapro LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type (Debug/Release/RelWithDebInfo)" FORCE)
 endif()
 
-if(DEFINED ASCEND_CANN_PACKAGE_PATH)
-elseif(DEFINED ENV{ASCEND_HOME_PATH})
-    set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}" CACHE PATH "ASCEND CANN package installation directory" FORCE)
-else()
-    set(ASCEND_CANN_PACKAGE_PATH "${DEFAULT_ASCEND_CANN_PACKAGE_PATH}" CACHE PATH "ASCEND CANN package installation directory")
+set(CMAKE_CUDA_FLAGS_DEBUG "-G -g -O0" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "" FORCE)
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3" CACHE STRING "" FORCE)
+
+find_package(CUDAToolkit REQUIRED)
+
+if(NOT CUTLASS_DIR)
+  if(DEFINED ENV{CUTLASS_DIR})
+    set(CUTLASS_DIR "$ENV{CUTLASS_DIR}" CACHE PATH "CUTLASS repository root")
+  else()
+    set(CUTLASS_DIR "${CMAKE_SOURCE_DIR}/../cutlass" CACHE PATH "CUTLASS repository root")
+  endif()
 endif()
 
-set(RUN_MODE "npu" CACHE STRING "run mode: npu")
-set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Build type Release/Debug (default Debug)" FORCE)
-set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_LIST_DIR}/out" CACHE STRING "path for install()" FORCE)
+set(CUDAPRO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src")
+set(CUDAPRO_BENCH_DIR "${CMAKE_SOURCE_DIR}/benchmarks")
+set(CUDAPRO_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include")
 
-if(EXISTS ${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake)
-    set(ASCENDC_CMAKE_DIR ${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake)
-elseif(EXISTS ${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake)
-    set(ASCENDC_CMAKE_DIR ${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake)
-elseif(EXISTS ${ASCEND_CANN_PACKAGE_PATH}/ascendc_devkit/tikcpp/samples/cmake)
-    set(ASCENDC_CMAKE_DIR ${ASCEND_CANN_PACKAGE_PATH}/ascendc_devkit/tikcpp/samples/cmake)
-else()
-    message(FATAL_ERROR "ascendc_kernel_cmake does not exist, please check whether the cann package is installed.")
-endif()
+include("${CMAKE_SOURCE_DIR}/cmake/CudaLessons.cmake")
 
-include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
+cudapro_register_cuda_sources("${CUDAPRO_SOURCE_DIR}")
+cudapro_register_cuda_sources("${CUDAPRO_BENCH_DIR}")
+cudapro_add_all_cuda_target()
 
-# ascendc_library use to add kernel file to generate ascendc library
-ascendc_library(kernels STATIC
-    hello_world.cpp
-)
-
-add_executable(main main.cpp)
-
-target_link_libraries(main PRIVATE
-    kernels
-)  
+message(STATUS "Project:    cudapro")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "CUDA arch:  sm_${CUDAPRO_CUDA_ARCH}")
+message(STATUS "CUTLASS:    ${CUTLASS_DIR}")
+message(STATUS "Sources:    ${CUDAPRO_SOURCE_DIR}")
+message(STATUS "Benchmarks: ${CUDAPRO_BENCH_DIR}")
+message(STATUS "Binaries:   ${CMAKE_BINARY_DIR}/bin/")

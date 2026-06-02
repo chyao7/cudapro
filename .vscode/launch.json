@@ -1,0 +1,105 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "debugTarget",
+      "type": "promptString",
+      "description": "CMake target（与 .cu 主文件名相同）",
+      "default": "lesson00_vector_add"
+    },
+    {
+      "id": "kernelFunction",
+      "type": "promptString",
+      "description": "__global__ 函数名（如 vector_add）",
+      "default": "vector_add"
+    }
+  ],
+  "configurations": [
+    {
+      "name": "★ CUDA lesson00（进 kernel）",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/bin/lesson00_vector_add",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+      "miDebuggerArgs": "-ix ${workspaceFolder}/.cuda_gdbinit",
+      "environment": [
+        {
+          "name": "CUDA_LAUNCH_BLOCKING",
+          "value": "1"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "kernel 函数断点（比行断点可靠）",
+          "text": "-break-insert -f vector_add",
+          "ignoreFailures": false
+        },
+        {
+          "description": "kernel 源码行断点（双保险）",
+          "text": "-break-insert -f ${workspaceFolder}/src/lesson00_vector_add.cu:30",
+          "ignoreFailures": true
+        },
+        {
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "cmake: build lesson00_vector_add"
+    },
+    {
+      "name": "CUDA 选择 target + kernel",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/bin/${input:debugTarget}",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+      "miDebuggerArgs": "-ix ${workspaceFolder}/.cuda_gdbinit",
+      "environment": [
+        {
+          "name": "CUDA_LAUNCH_BLOCKING",
+          "value": "1"
+        }
+      ],
+      "setupCommands": [
+        {
+          "text": "-break-insert -f ${input:kernelFunction}",
+          "ignoreFailures": false
+        },
+        {
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "cmake: build target"
+    },
+    {
+      "name": "CMake Tools: Debug",
+      "type": "cmake",
+      "request": "launch",
+      "cmakeDebugType": "debug"
+    },
+    {
+      "name": "Host: gdb 仅 main",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/bin/lesson00_vector_add",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": true,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "cmake: build lesson00_vector_add"
+    }
+  ]
+}

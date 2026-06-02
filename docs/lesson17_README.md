@@ -2,7 +2,7 @@
 
 使用 CUTLASS API 实现 Attention 输入侧的 **QKV 线性投影** 与 **Q/K 的 per-head RMSNorm**。
 
-源文件：`lesson17_qkv_rmsnorm.cu`
+源文件：`src/lesson17_qkv_rmsnorm.cu`
 
 > 公式使用 `$...$`（行内）和 `$$...$$`（独立一行）。Cursor / VS Code 预览需开启 Markdown 数学公式；也可直接看下方「纯文本公式」小节。
 
@@ -259,13 +259,11 @@ rmsnorm_qkv_heads_strided<<<T * NUM_KV_HEADS, HEAD_DIM>>>(
 需本地 CUTLASS 源码（include 路径）。
 
 ```bash
-nvcc -O3 -arch=sm_86 \
-  -I/path/to/cutlass/include \
-  -I/path/to/cutlass/tools/util/include \
-  -o lesson17 lesson17_qkv_rmsnorm.cu
+./scripts/configure.sh release
+./scripts/build.sh release lesson17_qkv_rmsnorm
 
-./lesson17           # 默认 T=128
-./lesson17 4096      # 指定 token 数
+./build-release/bin/lesson17_qkv_rmsnorm           # 默认 T=128
+./build-release/bin/lesson17_qkv_rmsnorm 4096      # 指定 token 数
 ```
 
 要求：**Ampere+（sm_80+）** Tensor Core。
